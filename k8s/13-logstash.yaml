@@ -1,0 +1,94 @@
+# Logstash is a required stage in this pipeline: Filebeat -> Logstash -> Elasticsearch.
+# It parses the app's plain-text log lines into real structured fields
+# (log_level, service_name, log_message) so Kibana can filter/aggregate on
+# log_level directly instead of doing a text search on the raw message.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-config
+  namespace: logging
+data:
+  logstash.conf: |-
+    input {
+      beats {
+        port => 5044
+      }
+    }
+
+    filter {
+      # Filebeat's autodiscover watches every pod in the cluster (see
+      # k8s/12-filebeat.yaml), not just demo-app -- so this pipeline also
+      # receives Kubernetes system component logs (kindnet, etcd,
+      # kube-proxy, ...). Those don't match our app's log format, so drop
+      # them here: app-logs-* stays scoped to the app this course is about.
+      grok {
+        match => {
+          "message" => "%{TIMESTAMP_ISO8601:log_timestamp} %{LOGLEVEL:log_level} %{DATA:service_name}: %{GREEDYDATA:log_message}"
+        }
+        tag_on_failure => ["_grokparsefailure"]
+      }
+
+      if "_grokparsefailure" in [tags] {
+        drop { }
+      }
+    }
+
+    output {
+      elasticsearch {
+        hosts => ["http://elasticsearch.logging.svc.cluster.local:9200"]
+        index => "app-logs-%{+YYYY.MM.dd}"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logstash
+  namespace: logging
+  labels:
+    app: logstash
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logstash
+  template:
+    metadata:
+      labels:
+        app: logstash
+    spec:
+      containers:
+        - name: logstash
+          image: docker.elastic.co/logstash/logstash:9.4.3
+          ports:
+            - containerPort: 5044
+          env:
+            - name: LS_JAVA_OPTS
+              value: "-Xms256m -Xmx256m"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 768Mi
+          volumeMounts:
+            - name: config
+              mountPath: /usr/share/logstash/pipeline/logstash.conf
+              subPath: logstash.conf
+      volumes:
+        - name: config
+          configMap:
+            name: logstash-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logstash
+  namespace: logging
+spec:
+  selector:
+    app: logstash
+  ports:
+    - port: 5044
+      targetPort: 5044
